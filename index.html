@@ -463,10 +463,17 @@ async function boot(){
     }catch(e){sb=null;console.warn("Supabase init failed, using local mode",e);}
   }
   if(MODE==="supabase"){
+    const errMsg=authHashError();
+    // react to auth changes (e.g. a confirmation/reset link landing back on the app)
+    sb.auth.onAuthStateChange((ev,s)=>{
+      if((ev==="SIGNED_IN"||ev==="TOKEN_REFRESHED")&&s&&s.user&&!authUser){authUser=s.user;afterAuth();}
+    });
     try{const {data:{session}}=await sb.auth.getSession();
       if(session&&session.user){authUser=session.user;return afterAuth();}
     }catch(e){}
-    return showSignIn();
+    showSignIn();
+    if(errMsg){const h=$("#signHint");if(h){h.textContent=errMsg+" — just sign in again below.";h.style.color="var(--crit)";}}
+    return;
   }
   // (c) plain static hosting → this browser only
   MODE="local";readOnly=false;
@@ -474,9 +481,19 @@ async function boot(){
   resumeLocalIdentity();return me.name?startApp():showSignIn();
 }
 function resumeLocalIdentity(){const id=localStorage.getItem("kaj_identity");if(id){try{me=Object.assign(me,JSON.parse(id));}catch(e){}}}
+function authHashError(){
+  const h=location.hash||"";
+  if(h.indexOf("error")===-1&&h.indexOf("access_token")===-1)return null;
+  let msg=null;
+  if(h.indexOf("error")!==-1){const m=/error_description=([^&]+)/.exec(h);msg=m?decodeURIComponent(m[1].replace(/\+/g," ")):"That sign-in link was invalid or expired";}
+  try{history.replaceState(null,"",location.pathname+location.search);}catch(e){location.hash="";}
+  return msg;
+}
 
 /* ---- Supabase auth + workspace ---- */
+let authInited=false;
 async function afterAuth(){
+  if(authInited)return;authInited=true;
   const md=(authUser&&authUser.user_metadata)||{};
   me.name=md.name||(authUser.email||"user").split("@")[0];
   me.role=md.role==="client"?"client":"team";
@@ -510,9 +527,15 @@ async function handleAuth(signup,role){
     if(signup){
       const name=($("#signName").value||"").trim();if(!name){toast("Enter your name");go.disabled=false;return;}
       const clientId=role==="client"?($("#signClient").value||null):null;
-      const {data,error}=await sb.auth.signUp({email,password:pw,options:{data:{name,role,clientId}}});
+      const {data,error}=await sb.auth.signUp({email,password:pw,options:{data:{name,role,clientId},emailRedirectTo:location.origin}});
       if(error)throw error;
-      if(!data.session){toast("Account created — confirm via the email we sent, then sign in");go.disabled=false;go.textContent="Sign in";return;}
+      if(!data.session){
+        // email confirmation is ON in Supabase — try an immediate sign-in in case it's actually off
+        const {data:si}=await sb.auth.signInWithPassword({email,password:pw}).catch(()=>({data:{}}));
+        if(si&&si.session){authUser=si.user;return afterAuth();}
+        toast("Account created. If asked, confirm via the email link — or turn off email confirmation in Supabase for instant access.");
+        go.disabled=false;go.textContent="Sign in";return;
+      }
       authUser=data.user;await afterAuth();
     }else{
       const {data,error}=await sb.auth.signInWithPassword({email,password:pw});
@@ -613,7 +636,7 @@ function startApp(){
   render();
 }
 async function switchUser(){
-  if(MODE==="supabase"&&sb){try{await sb.auth.signOut();}catch(e){}authUser=null;if(rtChan){try{sb.removeChannel(rtChan);}catch(e){}rtChan=null;}}
+  if(MODE==="supabase"&&sb){try{await sb.auth.signOut();}catch(e){}authUser=null;authInited=false;if(rtChan){try{sb.removeChannel(rtChan);}catch(e){}rtChan=null;}}
   try{localStorage.removeItem("kaj_identity");}catch(e){}
   me={name:"",role:"team",clientId:null,color:"#4c8dff"};
   $("#app").style.display="none";
