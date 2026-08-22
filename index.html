@@ -320,6 +320,14 @@ table.log tr:hover td{background:var(--sunken)}
 .menubtn{display:none}
 .scrim{display:none} /* desktop: keep scrim out of the grid flow (mobile media query re-enables it) */
 </style>
+<script>
+/* Supabase backend config — publishable (anon) key is safe to expose client-side.
+   RLS on the `workspace` table is what actually protects the data. */
+window.KAJ={
+  SUPABASE_URL:"https://pgrzarihasndpdfwmpex.supabase.co",
+  SUPABASE_KEY:"sb_publishable_dU199Xg1MSCZ5kO2wePhaQ_4hrgk8Ev"
+};
+</script>
 </head>
 <body>
 <!-- SIGN IN -->
@@ -332,10 +340,13 @@ table.log tr:hover td{background:var(--sunken)}
       <button data-role="team" class="on">I'm KAJ team</button>
       <button data-role="client">I'm a client</button>
     </div>
-    <div class="field"><label>Your name</label><input id="signName" placeholder="e.g. Kanieshk" autocomplete="off"></div>
+    <div class="field" id="emailWrap" style="display:none"><label>Email</label><input id="signEmail" type="email" placeholder="you@kajmedia.com" autocomplete="email"></div>
+    <div class="field" id="pwWrap" style="display:none"><label>Password</label><input id="signPw" type="password" placeholder="••••••••" autocomplete="current-password"></div>
+    <div class="field" id="nameWrap"><label>Your name</label><input id="signName" placeholder="e.g. Kanieshk" autocomplete="name"></div>
     <div class="field" id="clientPickWrap" style="display:none"><label>Which brand are you?</label><select id="signClient"></select></div>
     <button class="btn primary" id="signGo" style="width:100%;justify-content:center;padding:11px;margin-top:6px">Enter dashboard</button>
-    <div class="hint" id="signHint">Your name is stamped on everything you log so the team can see who updated what. Live-synced for everyone on the link.</div>
+    <div id="authToggle" style="display:none;text-align:center;font-size:12.5px;color:var(--muted);margin-top:12px">New here? <b id="authSwitch" style="color:var(--accent);cursor:pointer">Create an account</b></div>
+    <div class="hint" id="signHint">Your name is stamped on everything you log so the team can see who updated what. Live-synced for everyone.</div>
   </div>
 </div>
 
@@ -370,6 +381,8 @@ table.log tr:hover td{background:var(--sunken)}
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 <div class="toast" id="toast"></div>
 
+<!-- Supabase JS client (vendored locally — no CDN dependency at runtime) -->
+<script src="vendor/supabase.js"></script>
 <script>
 (function(){
 "use strict";
@@ -410,7 +423,9 @@ const RANGES=[["day","Day",1],["week","Week",7],["month","Month",30],["quarter",
 
 /* ===================== STATE ===================== */
 let state={clients:[],members:[],activity:[],meta:{}};
-let cap=null, readOnly=false, MODE="artifact"; // "artifact" (inside Claude) | "local" (hosted / standalone)
+let cap=null, readOnly=false, MODE="artifact"; // "artifact" (inside Claude) | "supabase" (real backend) | "local" (browser only)
+let sb=null, authUser=null, rtChan=null, applyingRemote=false;
+const tabId=Math.random().toString(36).slice(2);
 let me={name:"",role:"team",clientId:null,color:"#4c8dff"};
 let ui={view:"overview",clientId:null,tab:"overview",range:"month",railOpen:false};
 let saveTimer=null;
@@ -430,29 +445,96 @@ function colorFor(s){let h=0;for(const c of(s||"?"))h=(h*31+c.charCodeAt(0))>>>0
 function initials(n){return(n||"?").trim().split(/\s+/).slice(0,2).map(w=>w[0]).join("").toUpperCase();}
 
 /* ===================== PERSISTENCE ===================== */
+function adoptState(d){if(!d||!Array.isArray(d.clients))return;state=d;state.clients=state.clients||[];state.members=state.members||[];state.activity=state.activity||[];state.meta=state.meta||{};}
 async function boot(){
-  try{cap=await(window.claude&&window.claude.use?window.claude.use("artifact"):Promise.resolve(null));}catch(e){cap=null;}
-  MODE=cap?"artifact":"local";
-  if(MODE==="artifact"){
-    try{const r=await fetch("data/state.json",{cache:"no-store"});if(r.ok){const d=await r.json();if(d&&Array.isArray(d.clients)){state=d;state.members=state.members||[];state.activity=state.activity||[];}}}catch(e){}
-  }else{
-    // hosted / standalone (e.g. Vercel): persist to this browser
-    try{const raw=localStorage.getItem("kaj_state");if(raw){const d=JSON.parse(raw);if(d&&Array.isArray(d.clients)){state=d;state.members=state.members||[];state.activity=state.activity||[];}}}catch(e){}
-    readOnly=false;
-  }
   const th=localStorage.getItem("kaj_theme");if(th)document.documentElement.setAttribute("data-theme",th);
   try{const sv=localStorage.getItem("kaj_ui");if(sv)ui=Object.assign(ui,JSON.parse(sv));}catch(e){}
-  const id=localStorage.getItem("kaj_identity");
-  if(id){try{me=Object.assign(me,JSON.parse(id));}catch(e){}}
-  if(me.name){startApp();}else{showSignIn();}
+  // (a) inside the Claude artifact runtime → native shared store
+  try{cap=await(window.claude&&window.claude.use?window.claude.use("artifact"):Promise.resolve(null));}catch(e){cap=null;}
+  if(cap){MODE="artifact";
+    try{const r=await fetch("data/state.json",{cache:"no-store"});if(r.ok)adoptState(await r.json());}catch(e){}
+    resumeLocalIdentity();return me.name?startApp():showSignIn();
+  }
+  // (b) Supabase backend configured → real auth + shared DB + realtime
+  if(window.KAJ&&window.KAJ.SUPABASE_URL&&window.KAJ.SUPABASE_KEY){
+    try{if(!window.supabase||!window.supabase.createClient)throw new Error("supabase lib not loaded");
+      sb=window.supabase.createClient(window.KAJ.SUPABASE_URL,window.KAJ.SUPABASE_KEY,{auth:{persistSession:true,autoRefreshToken:true}});
+      MODE="supabase";
+    }catch(e){sb=null;console.warn("Supabase init failed, using local mode",e);}
+  }
+  if(MODE==="supabase"){
+    try{const {data:{session}}=await sb.auth.getSession();
+      if(session&&session.user){authUser=session.user;return afterAuth();}
+    }catch(e){}
+    return showSignIn();
+  }
+  // (c) plain static hosting → this browser only
+  MODE="local";readOnly=false;
+  try{const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));}catch(e){}
+  resumeLocalIdentity();return me.name?startApp():showSignIn();
+}
+function resumeLocalIdentity(){const id=localStorage.getItem("kaj_identity");if(id){try{me=Object.assign(me,JSON.parse(id));}catch(e){}}}
+
+/* ---- Supabase auth + workspace ---- */
+async function afterAuth(){
+  const md=(authUser&&authUser.user_metadata)||{};
+  me.name=md.name||(authUser.email||"user").split("@")[0];
+  me.role=md.role==="client"?"client":"team";
+  me.clientId=md.clientId||null;
+  me.color=colorFor(me.name);
+  await loadWorkspace();
+  subscribeRealtime();
+  $("#signwrap").style.display="none";
+  touchMember();doSave();
+  startApp();
+}
+async function loadWorkspace(){
+  try{const {data,error}=await sb.from("workspace").select("data").eq("id","main").maybeSingle();
+    if(!error&&data&&data.data&&Array.isArray(data.data.clients))adoptState(data.data);
+  }catch(e){console.warn("loadWorkspace",e);}
+}
+function subscribeRealtime(){
+  try{if(rtChan)sb.removeChannel(rtChan);
+    rtChan=sb.channel("kaj-ws").on("postgres_changes",{event:"*",schema:"public",table:"workspace",filter:"id=eq.main"},payload=>{
+      const nw=payload.new&&payload.new.data;if(!nw||!Array.isArray(nw.clients))return;
+      if(payload.new.updated_by===tabId)return; // ignore our own echo
+      adoptState(nw);applyingRemote=true;render();applyingRemote=false;setSync("saved");
+    }).subscribe();
+  }catch(e){console.warn("realtime",e);}
+}
+async function handleAuth(signup,role){
+  const email=($("#signEmail").value||"").trim(),pw=$("#signPw").value||"";
+  if(!email||!pw){toast("Enter your email and password");return;}
+  const go=$("#signGo");go.disabled=true;go.textContent="Please wait…";
+  try{
+    if(signup){
+      const name=($("#signName").value||"").trim();if(!name){toast("Enter your name");go.disabled=false;return;}
+      const clientId=role==="client"?($("#signClient").value||null):null;
+      const {data,error}=await sb.auth.signUp({email,password:pw,options:{data:{name,role,clientId}}});
+      if(error)throw error;
+      if(!data.session){toast("Account created — confirm via the email we sent, then sign in");go.disabled=false;go.textContent="Sign in";return;}
+      authUser=data.user;await afterAuth();
+    }else{
+      const {data,error}=await sb.auth.signInWithPassword({email,password:pw});
+      if(error)throw error;
+      authUser=data.user;await afterAuth();
+    }
+  }catch(e){toast((e&&e.message)||"Sign-in failed");go.disabled=false;go.textContent=signup?"Create account":"Sign in";}
 }
 function persistUI(){try{localStorage.setItem("kaj_ui",JSON.stringify({view:ui.view,clientId:ui.clientId,tab:ui.tab,range:ui.range}));}catch(e){}}
 function scheduleSave(){
-  if(readOnly){setSync("readonly");return;}
+  if(readOnly||applyingRemote)return;
   state.meta.updatedAt=new Date().toISOString();setSync("saving");
-  clearTimeout(saveTimer);saveTimer=setTimeout(doSave,900);
+  clearTimeout(saveTimer);saveTimer=setTimeout(doSave,700);
 }
 async function doSave(){
+  if(MODE==="supabase"){
+    if(!sb){setSync("error");return;}
+    try{const {error}=await sb.from("workspace").upsert({id:"main",data:state,updated_at:new Date().toISOString(),updated_by:tabId});
+      if(error)throw error;setSync("saved");
+    }catch(e){console.warn("save",e);setSync("error");}
+    return;
+  }
   if(MODE==="local"){try{localStorage.setItem("kaj_state",JSON.stringify(state));setSync("saved");}catch(e){setSync("error");}return;}
   if(!cap){setSync("readonly");return;}
   try{await cap.publish({"data/state.json":{content:JSON.stringify(state),contentType:"application/json"}});setSync("saved");}
@@ -464,7 +546,7 @@ async function doSave(){
   }
 }
 function setSync(s){const d=$("#syncDot"),t=$("#syncText");if(!d)return;d.className="sd";
-  const savedTxt=MODE==="local"?"Saved on this device":"Synced";
+  const savedTxt=MODE==="supabase"?"Synced live":MODE==="local"?"Saved on this device":"Synced";
   const m={saved:[savedTxt,""],saving:["Saving…","saving"],readonly:["View only","err"],error:["Save failed","err"]}[s]||[savedTxt,""];
   t.textContent=m[0];if(m[1])d.classList.add(m[1]);}
 
@@ -485,15 +567,32 @@ function touchMember(){
 /* ===================== SIGN IN ===================== */
 function showSignIn(){
   $("#signwrap").style.display="grid";
-  const rt=$("#roletog");let role="team";
+  const rt=$("#roletog");let role="team";let signup=false;
   const sel=$("#signClient");
-  function fillClients(){sel.innerHTML=state.clients.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join("")||`<option value="">No clients yet</option>`;}
+  const isSup=MODE==="supabase";
+  $("#emailWrap").style.display=isSup?"":"none";
+  $("#pwWrap").style.display=isSup?"":"none";
+  $("#authToggle").style.display=isSup?"":"none";
+  function fillClients(){sel.innerHTML=state.clients.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join("")||`<option value="">Ask KAJ to add your brand first</option>`;}
   fillClients();
-  rt.querySelectorAll("button").forEach(b=>b.onclick=()=>{rt.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");role=b.dataset.role;
-    $("#clientPickWrap").style.display=role==="client"?"":"none";
-    $("#signHint").textContent=role==="client"?"You'll see just your own brand's live dashboard and reports — updated by the KAJ team in real time.":"Your name is stamped on everything you log so the team sees who updated what. Live-synced for everyone on the link.";});
-  $("#signName").addEventListener("keydown",e=>{if(e.key==="Enter")$("#signGo").click();});
+  function sync(){
+    const profile=!isSup||signup; // name+role+client shown for local, or supabase sign-up
+    $("#nameWrap").style.display=profile?"":"none";
+    rt.style.display=profile?"":"none";
+    $("#clientPickWrap").style.display=(profile&&role==="client")?"":"none";
+    $("#signGo").textContent=isSup?(signup?"Create account":"Sign in"):"Enter dashboard";
+    $("#signGo").disabled=false;
+    $("#authSwitch").textContent=signup?"Have an account? Sign in":"Create an account";
+    $("#signHint").textContent=role==="client"
+      ?"You'll see just your own brand's live dashboard & reports — updated by KAJ in real time."
+      :(isSup?"Real login. Everything you log is stamped with your name and synced live to your whole team.":"Your name is stamped on everything you log. Synced live for everyone.");
+  }
+  rt.querySelectorAll("button").forEach(b=>b.onclick=()=>{rt.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");role=b.dataset.role;sync();});
+  if(isSup){$("#authSwitch").onclick=()=>{signup=!signup;sync();};}
+  ["signEmail","signPw","signName"].forEach(id=>{const el2=$("#"+id);if(el2)el2.onkeydown=e=>{if(e.key==="Enter")$("#signGo").click();};});
+  sync();
   $("#signGo").onclick=()=>{
+    if(isSup)return handleAuth(signup,role);
     const name=$("#signName").value.trim();if(!name){$("#signName").focus();return;}
     me.name=name;me.role=role;me.color=colorFor(name);
     me.clientId=role==="client"?(sel.value||null):null;
@@ -513,7 +612,14 @@ function startApp(){
   if(!readOnly)scheduleSave();
   render();
 }
-function switchUser(){try{localStorage.removeItem("kaj_identity");}catch(e){}me={name:"",role:"team",clientId:null,color:"#4c8dff"};$("#app").style.display="none";showSignIn();$("#signName").value="";}
+async function switchUser(){
+  if(MODE==="supabase"&&sb){try{await sb.auth.signOut();}catch(e){}authUser=null;if(rtChan){try{sb.removeChannel(rtChan);}catch(e){}rtChan=null;}}
+  try{localStorage.removeItem("kaj_identity");}catch(e){}
+  me={name:"",role:"team",clientId:null,color:"#4c8dff"};
+  $("#app").style.display="none";
+  const em=$("#signEmail"),pw=$("#signPw"),nm=$("#signName");if(em)em.value="";if(pw)pw.value="";if(nm)nm.value="";
+  showSignIn();
+}
 
 /* ===================== DATA HELPERS ===================== */
 function getClient(id){return state.clients.find(c=>c.id===id);}
@@ -977,7 +1083,7 @@ function loadSamples(){
 /* ===================== CHROME ===================== */
 document.querySelectorAll(".ritem[data-nav]").forEach(b=>b.onclick=()=>{ui.view=b.dataset.nav;if(ui.view!=="client")ui.clientId=null;closeRail();render();});
 $("#addBtn").onclick=openAddModal;
-$("#meAvatar").onclick=()=>{openModal(`<div class="mh"><h2>${esc(me.name)}</h2><p>Signed in as ${me.role==="client"?"client":"KAJ team"}. Live-synced on this link.</p></div><div class="mb"><div class="fitem"><div class="fav" style="background:${me.color}">${initials(me.name)}</div><div class="fx"><b>${esc(me.name)}</b> <span class="tg">${me.role==="client"?"Client view":"KAJ team"}</span></div></div><p class="hint" style="margin-top:12px">Everyone with the link signs in with their own name. Every KPI log, task and edit is stamped with who did it — see the Activity tab.</p></div><div class="mf"><button class="btn ghost" id="cancel">Close</button><button class="btn" id="switch">Switch user</button></div>`);$("#cancel").onclick=closeModal;$("#switch").onclick=()=>{closeModal();switchUser();};};
+$("#meAvatar").onclick=()=>{const sup=MODE==="supabase";openModal(`<div class="mh"><h2>${esc(me.name)}</h2><p>Signed in as ${me.role==="client"?"client":"KAJ team"}${sup?" · "+esc((authUser&&authUser.email)||""):""}.</p></div><div class="mb"><div class="fitem"><div class="fav" style="background:${me.color}">${initials(me.name)}</div><div class="fx"><b>${esc(me.name)}</b> <span class="tg">${me.role==="client"?"Client view":"KAJ team"}</span> <span class="tg">${sup?"Live synced":MODE==="local"?"This device":"Shared"}</span></div></div><p class="hint" style="margin-top:12px">${sup?"Real accounts. Every KPI log, task and edit is stamped with your name and synced live to everyone — see the Activity tab.":"Every KPI log, task and edit is stamped with who did it — see the Activity tab."}</p></div><div class="mf"><button class="btn ghost" id="cancel">Close</button><button class="btn" id="switch">${sup?"Sign out":"Switch user"}</button></div>`);$("#cancel").onclick=closeModal;$("#switch").onclick=()=>{closeModal();switchUser();};};
 $("#shareBtn").onclick=()=>{const url=location.href.split("#")[0];if(navigator.clipboard)navigator.clipboard.writeText(url).then(()=>toast("Dashboard link copied")).catch(()=>toast("Copy the URL from your browser bar"));else toast("Copy the URL from your browser bar");};
 $("#themeBtn").onclick=()=>{const cur=document.documentElement.getAttribute("data-theme");const next=cur==="light"?"dark":"light";document.documentElement.setAttribute("data-theme",next);localStorage.setItem("kaj_theme",next);};
 function openRail(){$("#rail").classList.add("open");$("#scrim").classList.add("on");}function closeRail(){$("#rail").classList.remove("open");$("#scrim").classList.remove("on");}
