@@ -345,7 +345,7 @@ window.KAJ={
     <div class="field" id="nameWrap"><label>Your name</label><input id="signName" placeholder="e.g. Kanieshk" autocomplete="name"></div>
     <div class="field" id="clientPickWrap" style="display:none"><label>Which brand are you?</label><select id="signClient"></select></div>
     <button class="btn primary" id="signGo" style="width:100%;justify-content:center;padding:11px;margin-top:6px">Enter dashboard</button>
-    <div id="authToggle" style="display:none;text-align:center;font-size:12.5px;color:var(--muted);margin-top:12px">New here? <b id="authSwitch" style="color:var(--accent);cursor:pointer">Create an account</b></div>
+    <div id="authToggle" style="display:none;text-align:center;font-size:12.5px;color:var(--muted);margin-top:12px"><span id="authSwitch" style="color:var(--accent);cursor:pointer">Use secure email login</span><span id="authSignup" style="display:none"> · <b style="color:var(--accent);cursor:pointer">Create account</b></span></div>
     <div class="hint" id="signHint">Your name is stamped on everything you log so the team can see who updated what. Live-synced for everyone.</div>
   </div>
 </div>
@@ -471,6 +471,9 @@ async function boot(){
     try{const {data:{session}}=await sb.auth.getSession();
       if(session&&session.user){authUser=session.user;return afterAuth();}
     }catch(e){}
+    // no email session → resume a name-based identity if one was saved
+    resumeLocalIdentity();
+    if(me.name){await loadWorkspace();subscribeRealtime();touchMember();doSave();return startApp();}
     showSignIn();
     if(errMsg){const h=$("#signHint");if(h){h.textContent=errMsg+" — just sign in again below.";h.style.color="var(--crit)";}}
     return;
@@ -506,8 +509,11 @@ async function afterAuth(){
   startApp();
 }
 async function loadWorkspace(){
-  try{const {data,error}=await sb.from("workspace").select("data").eq("id","main").maybeSingle();
-    if(error)throw error;
+  try{const q=sb.from("workspace").select("data").eq("id","main").maybeSingle();
+    const res=await Promise.race([q,new Promise(r=>setTimeout(()=>r({__timeout:1}),2500))]);
+    if(res&&res.__timeout)throw new Error("network timeout");
+    if(res.error)throw res.error;
+    const data=res.data;
     if(data&&data.data&&Array.isArray(data.data.clients)){adoptState(data.data);return;}
   }catch(e){console.warn("workspace unavailable, using local copy",e);
     try{const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));}catch(_){}
@@ -596,41 +602,51 @@ function touchMember(){
 }
 
 /* ===================== SIGN IN ===================== */
+/* Name-based sign-in works everywhere with ZERO setup. Email/password is an
+   optional "secure login" that only appears when a backend is present. */
+async function enterAsName(role,sel){
+  const name=($("#signName").value||"").trim();if(!name){$("#signName").focus();return;}
+  me.name=name;me.role=role;me.color=colorFor(name);me.clientId=role==="client"?(sel.value||null):null;
+  try{localStorage.setItem("kaj_identity",JSON.stringify(me));}catch(e){}
+  $("#signwrap").style.display="none";
+  if(MODE==="supabase"){await loadWorkspace();subscribeRealtime();touchMember();doSave();startApp();}
+  else{touchMember();scheduleSave();startApp();}
+}
 function showSignIn(){
   $("#signwrap").style.display="grid";
-  const rt=$("#roletog");let role="team";let signup=false;
-  const sel=$("#signClient");
+  const rt=$("#roletog");const sel=$("#signClient");
   const isSup=MODE==="supabase";
-  $("#emailWrap").style.display=isSup?"":"none";
-  $("#pwWrap").style.display=isSup?"":"none";
-  $("#authToggle").style.display=isSup?"":"none";
+  let role="team";let authMode="name"; // "name" | "signin" | "signup"
   function fillClients(){sel.innerHTML=state.clients.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join("")||`<option value="">Ask KAJ to add your brand first</option>`;}
   fillClients();
+  $("#authToggle").style.display=isSup?"":"none"; // email option only when a backend is configured
+  const asb=$("#authSignup").querySelector("b");
   function sync(){
-    const profile=!isSup||signup; // name+role+client shown for local, or supabase sign-up
+    const email=(authMode!=="name");
+    const profile=(authMode==="name"||authMode==="signup");
+    $("#emailWrap").style.display=email?"":"none";
+    $("#pwWrap").style.display=email?"":"none";
     $("#nameWrap").style.display=profile?"":"none";
     rt.style.display=profile?"":"none";
     $("#clientPickWrap").style.display=(profile&&role==="client")?"":"none";
-    $("#signGo").textContent=isSup?(signup?"Create account":"Sign in"):"Enter dashboard";
+    $("#signGo").textContent=authMode==="name"?"Enter dashboard":authMode==="signup"?"Create account":"Sign in";
     $("#signGo").disabled=false;
-    $("#authSwitch").textContent=signup?"Have an account? Sign in":"Create an account";
+    $("#authSwitch").textContent=email?"← Back to quick name sign-in":"Use secure email login";
+    $("#authSignup").style.display=email?"":"none";
+    if(asb)asb.textContent=authMode==="signin"?"Create account":"Have an account? Sign in";
+    $("#signHint").style.color="";
     $("#signHint").textContent=role==="client"
-      ?"You'll see just your own brand's live dashboard & reports — updated by KAJ in real time."
-      :(isSup?"Real login. Everything you log is stamped with your name and synced live to your whole team.":"Your name is stamped on everything you log. Synced live for everyone.");
+      ?"You'll see just your own brand's live dashboard & reports."
+      :(authMode==="name"
+          ?(isSup?"Just type your name to start — synced live to your team. No password needed.":"Type your name to start. Saved on this device.")
+          :"Secure login with email & password.");
   }
   rt.querySelectorAll("button").forEach(b=>b.onclick=()=>{rt.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");role=b.dataset.role;sync();});
-  if(isSup){$("#authSwitch").onclick=()=>{signup=!signup;sync();};}
-  ["signEmail","signPw","signName"].forEach(id=>{const el2=$("#"+id);if(el2)el2.onkeydown=e=>{if(e.key==="Enter")$("#signGo").click();};});
+  $("#authSwitch").onclick=()=>{authMode=(authMode==="name")?"signin":"name";sync();};
+  if(asb)asb.onclick=()=>{authMode=(authMode==="signup")?"signin":"signup";sync();};
+  ["signEmail","signPw","signName"].forEach(id=>{const e2=$("#"+id);if(e2)e2.onkeydown=e=>{if(e.key==="Enter")$("#signGo").click();};});
   sync();
-  $("#signGo").onclick=()=>{
-    if(isSup)return handleAuth(signup,role);
-    const name=$("#signName").value.trim();if(!name){$("#signName").focus();return;}
-    me.name=name;me.role=role;me.color=colorFor(name);
-    me.clientId=role==="client"?(sel.value||null):null;
-    try{localStorage.setItem("kaj_identity",JSON.stringify(me));}catch(e){}
-    touchMember();scheduleSave();
-    $("#signwrap").style.display="none";startApp();
-  };
+  $("#signGo").onclick=()=>{ if(authMode==="name")return enterAsName(role,sel); return handleAuth(authMode==="signup",role); };
 }
 function startApp(){
   $("#app").style.display="grid";
@@ -644,7 +660,7 @@ function startApp(){
   render();
 }
 async function switchUser(){
-  if(MODE==="supabase"&&sb){try{await sb.auth.signOut();}catch(e){}authUser=null;authInited=false;if(rtChan){try{sb.removeChannel(rtChan);}catch(e){}rtChan=null;}}
+  if(MODE==="supabase"&&sb){try{sb.auth.signOut();}catch(e){}authUser=null;authInited=false;if(rtChan){try{sb.removeChannel(rtChan);}catch(e){}rtChan=null;}}
   try{localStorage.removeItem("kaj_identity");}catch(e){}
   me={name:"",role:"team",clientId:null,color:"#4c8dff"};
   $("#app").style.display="none";
@@ -1122,7 +1138,7 @@ $("#menuBtn").onclick=openRail;$("#scrim").onclick=closeRail;
 let tt;function toast(m){const t=$("#toast");t.innerHTML=`<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M20 6 9 17l-5-5"/></svg>${esc(m)}`;t.classList.add("on");clearTimeout(tt);tt=setTimeout(()=>t.classList.remove("on"),2400);}
 
 /* flush unsaved local changes if the tab closes within the save debounce window */
-function flushLocal(){if(MODE==="local"){try{localStorage.setItem("kaj_state",JSON.stringify(state));}catch(e){}}}
+function flushLocal(){if(MODE==="local"||MODE==="supabase"){try{if(me.name)localStorage.setItem("kaj_state",JSON.stringify(state));}catch(e){}}}
 window.addEventListener("beforeunload",flushLocal);
 window.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden")flushLocal();});
 

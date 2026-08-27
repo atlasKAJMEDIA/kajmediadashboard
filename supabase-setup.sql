@@ -11,16 +11,20 @@ create table if not exists public.workspace (
   updated_by  text
 );
 
--- Row Level Security: only signed-in users can touch it.
+-- Row Level Security. The app signs people in by NAME (no password), which uses
+-- the public "anon" role — so we allow anon + authenticated to read/write the
+-- single shared row. (The site URL is your access boundary; treat it as private.)
+-- If you later switch everyone to secure email login, change "anon, authenticated"
+-- to just "authenticated" below and re-run.
 alter table public.workspace enable row level security;
 
-drop policy if exists "authenticated read"   on public.workspace;
-drop policy if exists "authenticated insert" on public.workspace;
-drop policy if exists "authenticated update" on public.workspace;
+drop policy if exists "workspace read"   on public.workspace;
+drop policy if exists "workspace insert" on public.workspace;
+drop policy if exists "workspace update" on public.workspace;
 
-create policy "authenticated read"   on public.workspace for select to authenticated using (true);
-create policy "authenticated insert" on public.workspace for insert to authenticated with check (true);
-create policy "authenticated update" on public.workspace for update to authenticated using (true) with check (true);
+create policy "workspace read"   on public.workspace for select to anon, authenticated using (true);
+create policy "workspace insert" on public.workspace for insert to anon, authenticated with check (true);
+create policy "workspace update" on public.workspace for update to anon, authenticated using (true) with check (true);
 
 -- Seed the single shared row.
 insert into public.workspace (id, data)
