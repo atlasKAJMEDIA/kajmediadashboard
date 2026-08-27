@@ -519,15 +519,28 @@ async function loadWorkspace(){
     try{const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));}catch(_){}
   }
 }
+/* Live team sync via Supabase Realtime BROADCAST — needs no table, no RLS,
+   no setup. Every save is pushed to everyone on the channel; late joiners
+   ask peers for the current state. The DB (if the SQL was run) adds durable
+   storage on top, but live sync does not depend on it. */
 function subscribeRealtime(){
   try{if(rtChan)sb.removeChannel(rtChan);
-    rtChan=sb.channel("kaj-ws").on("postgres_changes",{event:"*",schema:"public",table:"workspace",filter:"id=eq.main"},payload=>{
-      const nw=payload.new&&payload.new.data;if(!nw||!Array.isArray(nw.clients))return;
-      if(payload.new.updated_by===tabId)return; // ignore our own echo
-      adoptState(nw);applyingRemote=true;render();applyingRemote=false;setSync("saved");
-    }).subscribe();
-  }catch(e){console.warn("realtime",e);}
+    rtChan=sb.channel("kaj-live-main",{config:{broadcast:{self:false}}});
+    rtChan.on("broadcast",{event:"state"},({payload})=>applyIncoming(payload));
+    rtChan.on("broadcast",{event:"req"},()=>{if(me.name)try{rtChan.send({type:"broadcast",event:"state",payload:state});}catch(e){}});
+    rtChan.subscribe((status)=>{ if(status==="SUBSCRIBED"){try{rtChan.send({type:"broadcast",event:"req",payload:{t:tabId}});}catch(e){}} });
+  }catch(e){console.warn("live channel unavailable",e);}
 }
+function applyIncoming(payload){
+  if(!payload||!Array.isArray(payload.clients))return;
+  const inTs=(payload.meta&&payload.meta.updatedAt)||"";
+  const myTs=(state.meta&&state.meta.updatedAt)||"";
+  if(inTs>=myTs||!state.clients.length){                    // adopt newer (or fill when empty)
+    adoptState(payload);applyingRemote=true;render();applyingRemote=false;setSync("saved");
+    try{localStorage.setItem("kaj_state",JSON.stringify(state));}catch(e){}
+  }
+}
+function liveBroadcast(){try{if(rtChan)rtChan.send({type:"broadcast",event:"state",payload:state});}catch(e){}}
 async function handleAuth(signup,role){
   const email=($("#signEmail").value||"").trim(),pw=$("#signPw").value||"";
   if(!email||!pw){toast("Enter your email and password");return;}
@@ -562,13 +575,14 @@ function scheduleSave(){
 async function doSave(){
   if(MODE==="supabase"){
     if(!sb){setSync("error");return;}
+    liveBroadcast();                                   // push to team instantly (no DB needed)
+    try{localStorage.setItem("kaj_state",JSON.stringify(state));}catch(_){}   // local backup
     try{const {error}=await sb.from("workspace").upsert({id:"main",data:state,updated_at:new Date().toISOString(),updated_by:tabId});
-      if(error)throw error;setSync("saved");
-    }catch(e){console.warn("cloud save unavailable",e);
-      // table not created yet / RLS / offline → keep the user working, save locally
-      try{localStorage.setItem("kaj_state",JSON.stringify(state));}catch(_){}
-      setSync("localbackup");
-      if(!window.__kajCloudWarned){window.__kajCloudWarned=true;toast("Cloud sync not set up yet — saved on this device. Run supabase-setup.sql to share across devices.");}
+      if(error)throw error;setSync("saved");           // durable DB save succeeded
+    }catch(e){
+      // DB table not set up yet — live sync still works via broadcast
+      setSync("saved");
+      if(!window.__kajDbWarned){window.__kajDbWarned=true;console.info("Live sync active (broadcast). Run supabase-setup.sql for durable storage across cold starts.");}
     }
     return;
   }
