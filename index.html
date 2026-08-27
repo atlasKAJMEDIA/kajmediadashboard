@@ -507,8 +507,11 @@ async function afterAuth(){
 }
 async function loadWorkspace(){
   try{const {data,error}=await sb.from("workspace").select("data").eq("id","main").maybeSingle();
-    if(!error&&data&&data.data&&Array.isArray(data.data.clients))adoptState(data.data);
-  }catch(e){console.warn("loadWorkspace",e);}
+    if(error)throw error;
+    if(data&&data.data&&Array.isArray(data.data.clients)){adoptState(data.data);return;}
+  }catch(e){console.warn("workspace unavailable, using local copy",e);
+    try{const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));}catch(_){}
+  }
 }
 function subscribeRealtime(){
   try{if(rtChan)sb.removeChannel(rtChan);
@@ -555,7 +558,12 @@ async function doSave(){
     if(!sb){setSync("error");return;}
     try{const {error}=await sb.from("workspace").upsert({id:"main",data:state,updated_at:new Date().toISOString(),updated_by:tabId});
       if(error)throw error;setSync("saved");
-    }catch(e){console.warn("save",e);setSync("error");}
+    }catch(e){console.warn("cloud save unavailable",e);
+      // table not created yet / RLS / offline → keep the user working, save locally
+      try{localStorage.setItem("kaj_state",JSON.stringify(state));}catch(_){}
+      setSync("localbackup");
+      if(!window.__kajCloudWarned){window.__kajCloudWarned=true;toast("Cloud sync not set up yet — saved on this device. Run supabase-setup.sql to share across devices.");}
+    }
     return;
   }
   if(MODE==="local"){try{localStorage.setItem("kaj_state",JSON.stringify(state));setSync("saved");}catch(e){setSync("error");}return;}
@@ -570,7 +578,7 @@ async function doSave(){
 }
 function setSync(s){const d=$("#syncDot"),t=$("#syncText");if(!d)return;d.className="sd";
   const savedTxt=MODE==="supabase"?"Synced live":MODE==="local"?"Saved on this device":"Synced";
-  const m={saved:[savedTxt,""],saving:["Saving…","saving"],readonly:["View only","err"],error:["Save failed","err"]}[s]||[savedTxt,""];
+  const m={saved:[savedTxt,""],saving:["Saving…","saving"],localbackup:["Saved on this device",""],readonly:["View only","err"],error:["Save failed","err"]}[s]||[savedTxt,""];
   t.textContent=m[0];if(m[1])d.classList.add(m[1]);}
 
 /* record + attribute changes */
