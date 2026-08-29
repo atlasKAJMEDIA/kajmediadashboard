@@ -464,16 +464,14 @@ async function boot(){
   }
   if(MODE==="supabase"){
     const errMsg=authHashError();
-    // react to auth changes (e.g. a confirmation/reset link landing back on the app)
-    sb.auth.onAuthStateChange((ev,s)=>{
-      if((ev==="SIGNED_IN"||ev==="TOKEN_REFRESHED")&&s&&s.user&&!authUser){authUser=s.user;afterAuth();}
-    });
-    try{const {data:{session}}=await sb.auth.getSession();
-      if(session&&session.user){authUser=session.user;return afterAuth();}
-    }catch(e){}
-    // no email session → resume a name-based identity if one was saved
+    sb.auth.onAuthStateChange((ev,s)=>{ if((ev==="SIGNED_IN"||ev==="TOKEN_REFRESHED")&&s&&s.user&&!authInited){authUser=s.user;afterAuth();} });
+    // IMMEDIATE base: load any local copy so the UI never blocks on the network
+    try{const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));}catch(e){}
+    let session=null;
+    try{const r=await Promise.race([sb.auth.getSession(),new Promise(res=>setTimeout(()=>res({data:{session:null}}),2500))]);session=r&&r.data&&r.data.session;}catch(e){}
+    if(session&&session.user){authUser=session.user;return afterAuth();}
     resumeLocalIdentity();
-    if(me.name){await loadWorkspace();subscribeRealtime();touchMember();doSave();return startApp();}
+    if(me.name){startApp();subscribeRealtime();touchMember();bgLoadWorkspace();return;}   // instant, Supabase loads in background
     showSignIn();
     if(errMsg){const h=$("#signHint");if(h){h.textContent=errMsg+" — just sign in again below.";h.style.color="var(--crit)";}}
     return;
@@ -502,22 +500,22 @@ async function afterAuth(){
   me.role=md.role==="client"?"client":"team";
   me.clientId=md.clientId||null;
   me.color=colorFor(me.name);
-  await loadWorkspace();
-  subscribeRealtime();
+  try{const raw=localStorage.getItem("kaj_state");if(raw&&!state.clients.length)adoptState(JSON.parse(raw));}catch(e){}
   $("#signwrap").style.display="none";
-  touchMember();doSave();
-  startApp();
+  startApp();subscribeRealtime();touchMember();bgLoadWorkspace();   // instant; Supabase in background
 }
+async function bgLoadWorkspace(){try{await loadWorkspace();render();}catch(e){}}
 async function loadWorkspace(){
   try{const q=sb.from("workspace").select("data").eq("id","main").maybeSingle();
     const res=await Promise.race([q,new Promise(r=>setTimeout(()=>r({__timeout:1}),2500))]);
     if(res&&res.__timeout)throw new Error("network timeout");
     if(res.error)throw res.error;
-    const data=res.data;
-    if(data&&data.data&&Array.isArray(data.data.clients)){adoptState(data.data);return;}
-  }catch(e){console.warn("workspace unavailable, using local copy",e);
-    try{const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));}catch(_){}
-  }
+    const d=res.data&&res.data.data;
+    if(d&&Array.isArray(d.clients)){                     // adopt DB only if it's newer (never clobber newer local edits)
+      const inTs=(d.meta&&d.meta.updatedAt)||"";const myTs=(state.meta&&state.meta.updatedAt)||"";
+      if(inTs>=myTs||!state.clients.length)adoptState(d);
+    }
+  }catch(e){console.warn("workspace load skipped (using local):",e&&e.message);}
 }
 /* Live team sync via Supabase Realtime BROADCAST — needs no table, no RLS,
    no setup. Every save is pushed to everyone on the channel; late joiners
@@ -533,6 +531,7 @@ function subscribeRealtime(){
 }
 function applyIncoming(payload){
   if(!payload||!Array.isArray(payload.clients))return;
+  if(!payload.clients.length&&state.clients.length)return;   // never let an empty broadcast wipe real data
   const inTs=(payload.meta&&payload.meta.updatedAt)||"";
   const myTs=(state.meta&&state.meta.updatedAt)||"";
   if(inTs>=myTs||!state.clients.length){                    // adopt newer (or fill when empty)
@@ -623,7 +622,7 @@ async function enterAsName(role,sel){
   me.name=name;me.role=role;me.color=colorFor(name);me.clientId=role==="client"?(sel.value||null):null;
   try{localStorage.setItem("kaj_identity",JSON.stringify(me));}catch(e){}
   $("#signwrap").style.display="none";
-  if(MODE==="supabase"){await loadWorkspace();subscribeRealtime();touchMember();doSave();startApp();}
+  if(MODE==="supabase"){startApp();subscribeRealtime();touchMember();scheduleSave();bgLoadWorkspace();}
   else{touchMember();scheduleSave();startApp();}
 }
 function showSignIn(){
@@ -1156,7 +1155,10 @@ function flushLocal(){if(MODE==="local"||MODE==="supabase"){try{if(me.name)local
 window.addEventListener("beforeunload",flushLocal);
 window.addEventListener("visibilitychange",()=>{if(document.visibilityState==="hidden")flushLocal();});
 
-boot();
+boot().catch(e=>{console.error("boot failed, falling back to local:",e);
+  try{MODE="local";readOnly=false;const raw=localStorage.getItem("kaj_state");if(raw)adoptState(JSON.parse(raw));resumeLocalIdentity();me.name?startApp():showSignIn();}
+  catch(_){try{showSignIn();}catch(__){}}
+});
 })();
 </script>
 </body>
