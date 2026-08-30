@@ -371,6 +371,7 @@ window.KAJ={
       <div class="spacer"></div>
       <div class="synctag"><span class="sd" id="syncDot"></span><span id="syncText">Synced</span></div>
       <div class="avstack" id="avstack"></div>
+      <button class="btn sm" id="helpBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/></svg>How it works</button>
       <button class="btn sm" id="shareBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/></svg>Share</button>
       <button class="btn primary" id="addBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>Add client</button>
     </div>
@@ -420,11 +421,35 @@ const AS_CHANNELS=["Cold Call","WhatsApp","Email","Voice Note","DM"];
 const PLATFORMS=["Instagram","YouTube","Twitter/X","LinkedIn","Email","WhatsApp"];
 const STATUSES=["Onboarding","Active","At Risk","Paused","Delivered"];
 const RANGES=[["day","Day",1],["week","Week",7],["month","Month",30],["quarter","Quarter",90],["year","Year",365]];
+/* Guided data entry — where each REAL number comes from */
+const METRIC_SOURCE={
+  outreach:"Count of DMs/emails/connection requests you sent today.",
+  dials:"Number of cold calls you dialled today.",
+  convos:"Live conversations / replies you actually had.",
+  positive:"Replies that showed interest (not 'no').",
+  booked:"Strategy calls booked into the calendar today.",
+  showed:"Booked calls that actually attended.",
+  qualified:"Calls where fit + budget were confirmed.",
+  closed:"Deals signed / paid today.",
+  followups:"Follow-up touches sent (WhatsApp/email/voice).",
+  spend:"₹ spent on ads/tools today (leave 0 if none).",
+  pipeline:"₹ value of open opportunities right now.",
+  produced:"Assets your team made today (reels, carousels, emails).",
+  posted:"Assets actually published today.",
+  impressions:"From Instagram Insights → Reach/Impressions for the day.",
+  reach:"Unique accounts reached — Instagram Insights.",
+  newfollowers:"Net new followers today — profile Insights.",
+  engagement:"Likes + saves + comments + shares for the day.",
+  visits:"Profile visits — Instagram Insights.",
+  dms:"New DMs received today.",
+  clicks:"Link clicks (bio link / email) today.",
+  revenue:"₹ revenue attributed to content today."
+};
 
 /* ===================== STATE ===================== */
 let state={clients:[],members:[],activity:[],meta:{}};
 let cap=null, readOnly=false, MODE="artifact"; // "artifact" (inside Claude) | "supabase" (real backend) | "local" (browser only)
-let sb=null, authUser=null, rtChan=null, applyingRemote=false;
+let sb=null, authUser=null, rtChan=null, applyingRemote=false, liveOn=false;
 const tabId=Math.random().toString(36).slice(2);
 let me={name:"",role:"team",clientId:null,color:"#4c8dff"};
 let ui={view:"overview",clientId:null,tab:"overview",range:"month",railOpen:false};
@@ -526,19 +551,50 @@ function subscribeRealtime(){
     rtChan=sb.channel("kaj-live-main",{config:{broadcast:{self:false}}});
     rtChan.on("broadcast",{event:"state"},({payload})=>applyIncoming(payload));
     rtChan.on("broadcast",{event:"req"},()=>{if(me.name)try{rtChan.send({type:"broadcast",event:"state",payload:state});}catch(e){}});
-    rtChan.subscribe((status)=>{ if(status==="SUBSCRIBED"){try{rtChan.send({type:"broadcast",event:"req",payload:{t:tabId}});}catch(e){}} });
+    // durable realtime when the DB table exists (survives everyone closing their tab)
+    rtChan.on("postgres_changes",{event:"*",schema:"public",table:"workspace",filter:"id=eq.main"},payload=>{
+      const nw=payload.new&&payload.new.data;if(nw&&payload.new.updated_by!==tabId)applyIncoming(nw);
+    });
+    rtChan.subscribe((status)=>{ if(status==="SUBSCRIBED"){liveOn=true;setSync("saved");try{rtChan.send({type:"broadcast",event:"req",payload:{t:tabId}});}catch(e){}} });
   }catch(e){console.warn("live channel unavailable",e);}
 }
-function applyIncoming(payload){
-  if(!payload||!Array.isArray(payload.clients))return;
-  if(!payload.clients.length&&state.clients.length)return;   // never let an empty broadcast wipe real data
-  const inTs=(payload.meta&&payload.meta.updatedAt)||"";
-  const myTs=(state.meta&&state.meta.updatedAt)||"";
-  if(inTs>=myTs||!state.clients.length){                    // adopt newer (or fill when empty)
-    adoptState(payload);applyingRemote=true;render();applyingRemote=false;setSync("saved");
-    try{localStorage.setItem("kaj_state",JSON.stringify(state));}catch(e){}
-  }
+/* MERGE incoming state into ours — union so NOBODY's data is lost:
+   clients by id, KPI logs by date, tasks by id, members, activity. Returns
+   true if anything actually changed (used to stop echo loops). */
+function mergeStates(inc){
+  if(!inc||!Array.isArray(inc.clients))return false;
+  const before=JSON.stringify(state);
+  const byId={};(state.clients||[]).forEach(c=>byId[c.id]=c);
+  inc.clients.forEach(ic=>{
+    const cur=byId[ic.id];
+    if(!cur){byId[ic.id]=ic;return;}
+    const incNewer=(ic.updatedAt||"")>=(cur.updatedAt||"");
+    const m=Object.assign({},incNewer?cur:ic,incNewer?ic:cur); // newer top-level fields win
+    const logs={};(cur.logs||[]).forEach(l=>logs[l.date]=l);
+    (ic.logs||[]).forEach(l=>{const e=logs[l.date];if(!e||(l.updatedAt||"")>=(e.updatedAt||""))logs[l.date]=l;});
+    m.logs=Object.values(logs).sort((a,b)=>a.date<b.date?1:-1);
+    const tasks={};(cur.tasks||[]).forEach(t=>tasks[t.id]=t);
+    (ic.tasks||[]).forEach(t=>{const e=tasks[t.id];if(!e||(t.updatedAt||"")>=(e.updatedAt||""))tasks[t.id]=t;});
+    m.tasks=Object.values(tasks);
+    m.delivery=incNewer?(ic.delivery||cur.delivery):(cur.delivery||ic.delivery);
+    m.goals=incNewer?(ic.goals||cur.goals):(cur.goals||ic.goals);
+    byId[ic.id]=m;
+  });
+  state.clients=Object.keys(byId).map(k=>byId[k]);
+  const mem={};(state.members||[]).forEach(x=>mem[x.name+"|"+x.role]=x);
+  (inc.members||[]).forEach(x=>{const e=mem[x.name+"|"+x.role];if(!e||(x.lastActive||"")>=(e.lastActive||""))mem[x.name+"|"+x.role]=x;});
+  state.members=Object.values(mem);
+  const act={};(state.activity||[]).concat(inc.activity||[]).forEach(a=>{if(a&&a.id)act[a.id]=a;});
+  state.activity=Object.values(act).sort((a,b)=>(a.at<b.at?1:-1)).slice(0,120);
+  state.meta=state.meta||{};const it=(inc.meta&&inc.meta.updatedAt)||"";if(it>(state.meta.updatedAt||""))state.meta.updatedAt=it;
+  return JSON.stringify(state)!==before;
 }
+function persistLocal(){try{if(me.name)localStorage.setItem("kaj_state",JSON.stringify(state));}catch(e){}}
+function applyIncoming(payload){
+  if(mergeStates(payload)){ render(); persistLocal(); liveConverge(); } // something new → show it & propagate the union
+}
+let convergeTimer=null;
+function liveConverge(){clearTimeout(convergeTimer);convergeTimer=setTimeout(()=>{liveBroadcast();if(sb)sb.from("workspace").upsert({id:"main",data:state,updated_at:new Date().toISOString(),updated_by:tabId}).then(()=>{},()=>{});},400);}
 function liveBroadcast(){try{if(rtChan)rtChan.send({type:"broadcast",event:"state",payload:state});}catch(e){}}
 async function handleAuth(signup,role){
   const email=($("#signEmail").value||"").trim(),pw=$("#signPw").value||"";
@@ -567,9 +623,9 @@ async function handleAuth(signup,role){
 }
 function persistUI(){try{localStorage.setItem("kaj_ui",JSON.stringify({view:ui.view,clientId:ui.clientId,tab:ui.tab,range:ui.range}));}catch(e){}}
 function scheduleSave(){
-  if(readOnly||applyingRemote)return;
+  if(readOnly)return;
   state.meta.updatedAt=new Date().toISOString();setSync("saving");
-  clearTimeout(saveTimer);saveTimer=setTimeout(doSave,700);
+  clearTimeout(saveTimer);saveTimer=setTimeout(doSave,600);
 }
 async function doSave(){
   if(MODE==="supabase"){
@@ -596,7 +652,7 @@ async function doSave(){
   }
 }
 function setSync(s){const d=$("#syncDot"),t=$("#syncText");if(!d)return;d.className="sd";
-  const savedTxt=MODE==="supabase"?"Synced live":MODE==="local"?"Saved on this device":"Synced";
+  const savedTxt=MODE==="supabase"?(liveOn?"Synced live":"Saved (offline)"):MODE==="local"?"Saved on this device":"Synced";
   const m={saved:[savedTxt,""],saving:["Saving…","saving"],localbackup:["Saved on this device",""],readonly:["View only","err"],error:["Save failed","err"]}[s]||[savedTxt,""];
   t.textContent=m[0];if(m[1])d.classList.add(m[1]);}
 
@@ -921,7 +977,7 @@ function renderKpiTab(v,c){
     <div class="field" style="max-width:220px"><label>Entry date</label><input type="date" id="logDate" value="${today}" max="${today}"></div>
     <div class="mgrid" id="mgrid"></div>
     <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn primary" id="saveLog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>Save entry</button><span class="hint">Updates trends, funnel, goals & the activity feed instantly.</span></div></div>`;
-  const mg=p.querySelector("#mgrid");metrics.forEach(m=>{const dd=el("div","minput");dd.innerHTML=`<label title="${esc(m.hint)}">${m.label}</label><input type="number" min="0" step="${['revenue','spend','pipeline'].includes(m.k)?'100':'1'}" data-mk="${m.k}" value="${existing[m.k]!=null?existing[m.k]:''}" placeholder="0">`;mg.appendChild(dd);});
+  const mg=p.querySelector("#mgrid");metrics.forEach(m=>{const dd=el("div","minput");dd.innerHTML=`<label title="${esc(m.hint)}">${m.label}</label><input type="number" min="0" step="${['revenue','spend','pipeline'].includes(m.k)?'100':'1'}" data-mk="${m.k}" value="${existing[m.k]!=null?existing[m.k]:''}" placeholder="Enter real number">${METRIC_SOURCE[m.k]?`<div class="hint" style="margin-top:4px;line-height:1.35">${esc(METRIC_SOURCE[m.k])}</div>`:''}`;mg.appendChild(dd);});
   p.querySelector("#saveLog").onclick=()=>{
     const date=p.querySelector("#logDate").value||today;const entry={date};
     p.querySelectorAll("[data-mk]").forEach(i=>{const val=i.value.trim();if(val!=="")entry[i.dataset.mk]=num(val);});
@@ -1145,6 +1201,29 @@ document.querySelectorAll(".ritem[data-nav]").forEach(b=>b.onclick=()=>{ui.view=
 $("#addBtn").onclick=openAddModal;
 $("#meAvatar").onclick=()=>{const sup=MODE==="supabase";openModal(`<div class="mh"><h2>${esc(me.name)}</h2><p>Signed in as ${me.role==="client"?"client":"KAJ team"}${sup?" · "+esc((authUser&&authUser.email)||""):""}.</p></div><div class="mb"><div class="fitem"><div class="fav" style="background:${me.color}">${initials(me.name)}</div><div class="fx"><b>${esc(me.name)}</b> <span class="tg">${me.role==="client"?"Client view":"KAJ team"}</span> <span class="tg">${sup?"Live synced":MODE==="local"?"This device":"Shared"}</span></div></div><p class="hint" style="margin-top:12px">${sup?"Real accounts. Every KPI log, task and edit is stamped with your name and synced live to everyone — see the Activity tab.":"Every KPI log, task and edit is stamped with who did it — see the Activity tab."}</p></div><div class="mf"><button class="btn ghost" id="cancel">Close</button><button class="btn" id="switch">${sup?"Sign out":"Switch user"}</button></div>`);$("#cancel").onclick=closeModal;$("#switch").onclick=()=>{closeModal();switchUser();};};
 $("#shareBtn").onclick=()=>{const url=location.href.split("#")[0];if(navigator.clipboard)navigator.clipboard.writeText(url).then(()=>toast("Dashboard link copied")).catch(()=>toast("Copy the URL from your browser bar"));else toast("Copy the URL from your browser bar");};
+const SETUP_SQL=`create table if not exists public.workspace (id text primary key default 'main', data jsonb not null default '{"clients":[],"members":[],"activity":[]}'::jsonb, updated_at timestamptz default now(), updated_by text);
+alter table public.workspace enable row level security;
+drop policy if exists "workspace all" on public.workspace;
+create policy "workspace all" on public.workspace for all to anon, authenticated using (true) with check (true);
+insert into public.workspace (id) values ('main') on conflict (id) do nothing;
+do $$ begin alter publication supabase_realtime add table public.workspace; exception when duplicate_object then null; end $$;`;
+$("#helpBtn").onclick=()=>{
+  const live=liveOn;
+  const sqlUrl="https://supabase.com/dashboard/project/pgrzarihasndpdfwmpex/sql/new";
+  openModal(`<div class="mh"><h2>How this dashboard works</h2><p>Plain-English guide — no code needed.</p></div><div class="mb">
+    <div class="field"><label>1 · Add a client</label><div class="val">Click <b>Add client</b>, pick Appointment Setting or Personal Branding. Each client gets its own dashboard with the right KPIs.</div></div>
+    <div class="field"><label>2 · Log real numbers daily</label><div class="val">Open a client → <b>Log KPIs</b>. Type the real numbers for the day (each box tells you where to get it — e.g. Impressions from Instagram Insights). Everything you type is stamped with your name.</div></div>
+    <div class="field"><label>3 · Read the insights</label><div class="val">Overview, Trends, Pipeline and the client Report update instantly from what you log. The <b>Activity</b> tab shows who changed what.</div></div>
+    <div class="field"><label>4 · Live team sync <span class="chip ${live?'good':'warn'}">${live?'ON — synced live':'OFF — device only'}</span></label>
+      <div class="val">${live?"Working now: when anyone on the link makes a change, it appears on everyone's screen within a second.":"Right now data saves only on this device. Turn on live sync below — a one-time, 30-second step."}</div></div>
+    ${live?"":`<div class="field"><label>Turn on live team sync (once)</label>
+      <div class="val" style="margin-bottom:8px">Open the Supabase SQL editor, paste the setup, click Run. That's it — then everyone's changes sync live.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" id="copySql">Copy the setup</button><a class="btn" href="${sqlUrl}" target="_blank" rel="noopener">Open Supabase SQL editor →</a></div>
+      <div class="hint" style="margin-top:8px">After Run: reload this page. The badge above turns green (“ON — synced live”).</div></div>`}
+  </div><div class="mf"><button class="btn ghost" id="cancel">Close</button></div>`);
+  $("#cancel").onclick=closeModal;
+  const cs=$("#copySql");if(cs)cs.onclick=()=>{if(navigator.clipboard)navigator.clipboard.writeText(SETUP_SQL).then(()=>toast("Setup copied — paste it in Supabase SQL editor & Run")).catch(()=>toast("Copy failed — open supabase-setup.sql in your repo"));else toast("Open supabase-setup.sql in your repo");};
+};
 $("#themeBtn").onclick=()=>{const cur=document.documentElement.getAttribute("data-theme");const next=cur==="light"?"dark":"light";document.documentElement.setAttribute("data-theme",next);localStorage.setItem("kaj_theme",next);};
 function openRail(){$("#rail").classList.add("open");$("#scrim").classList.add("on");}function closeRail(){$("#rail").classList.remove("open");$("#scrim").classList.remove("on");}
 $("#menuBtn").onclick=openRail;$("#scrim").onclick=closeRail;
